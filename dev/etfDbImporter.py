@@ -46,10 +46,11 @@ import logging
 from datetime import datetime, timedelta, date
 
 # DAO 模組放在非標準路徑，手動加入 sys.path 才能 import
-DAO_SRC_DIR = '/home/webuser/etf/etf_calculator/etfDbImporter/src'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DAO_SRC_DIR = os.path.join(BASE_DIR, 'src')
 if DAO_SRC_DIR not in sys.path:
     sys.path.insert(0, DAO_SRC_DIR)
-import DAO_dev as DAO
+import DAO as DAO
 
 # ══════════════════════════════════════════════════════════════════
 # 設定區：路徑、ETF 清單
@@ -57,9 +58,6 @@ import DAO_dev as DAO
 
 # report_generator 的輸出目錄，內含 tmp_<etfCode>/ 子資料夾
 reportDir = '/home/webuser/etf/etf_calculator/report_generator'
-
-# 本腳本自身的根目錄，用來放 log 檔
-baseDir = '/home/webuser/etf/etf_calculator/etfDbImporter/dev'
 
 # 交易員手動上傳的 showdown CSV 所在目錄，檔名格式：<etfCode>.csv
 showdownCsvDir = '/home/webuser/etf/showdown_csv/dev'
@@ -81,7 +79,7 @@ targetEtfList = ['0050', '0051', '0056', '00713', '00878', '00900', '00918', '00
 
 def setupLogging(targetDate):
     """初始化 logging：同時輸出到檔案（logs/import_<date>.log）和 stdout。"""
-    logDir = os.path.join(baseDir, 'logs')
+    logDir = os.path.join(BASE_DIR, 'logs')
     if not os.path.exists(logDir):
         os.makedirs(logDir)
     logFile = os.path.join(logDir, f'import_{targetDate}.log')
@@ -587,36 +585,36 @@ def importDataForDate(targetDate, useTestJson=False):
                 continue
 
             # ── CASE 2：暫停期 ───────────────────────────────────────────
-            if deadline is not None and adjustBegin is not None and deadline < targetDateObj < adjustBegin:
-                # Hard-coded: 00929 / 00918 讀 _tmp.csv，不讀截止日 JSON，不扣 DIFSHARES，不刪 CSV
-                if etfCode in ('00929', '00918'):
-                    tmpCsvPath = os.path.join(showdownCsvDir, f"{etfCode}_tmp.csv")
-                    if not os.path.exists(tmpCsvPath):
-                        logging.error(f"[SuspendPeriod][{etfCode}] _tmp.csv not found: {tmpCsvPath}, skipping")
-                        continue
-                    logging.info(f"[SuspendPeriod][{etfCode}] Using _tmp.csv: {tmpCsvPath}")
-                    try:
-                        newList, removedList, weightList = parseCsvFile(tmpCsvPath)
-                    except Exception as e:
-                        logging.exception(f"[SuspendPeriod][{etfCode}] Error reading _tmp.csv: {e}")
-                        continue
-                    stockNamesMap = dao.queryStockNames(targetDate)
-                    rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
-                                           {}, adjustBegin, adjustEnd, stockNamesMap)
-                    foundAnyFile = True
-                    dao.upsertRows(etfCode, targetDate, rows)
-                    continue
+            #if deadline is not None and adjustBegin is not None and deadline < targetDateObj < adjustBegin:
+            #    # Hard-coded: 00929 / 00918 讀 _tmp.csv，不讀截止日 JSON，不扣 DIFSHARES，不刪 CSV
+            #    if etfCode in ('00929', '00918'):
+            #        tmpCsvPath = os.path.join(showdownCsvDir, f"{etfCode}_tmp.csv")
+            #        if not os.path.exists(tmpCsvPath):
+            #            logging.error(f"[SuspendPeriod][{etfCode}] _tmp.csv not found: {tmpCsvPath}, skipping")
+            #            continue
+            #        logging.info(f"[SuspendPeriod][{etfCode}] Using _tmp.csv: {tmpCsvPath}")
+            #        try:
+            #            newList, removedList, weightList = parseCsvFile(tmpCsvPath)
+            #        except Exception as e:
+            #            logging.exception(f"[SuspendPeriod][{etfCode}] Error reading _tmp.csv: {e}")
+            #            continue
+            #        stockNamesMap = dao.queryStockNames(targetDate)
+            #        rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
+            #                               {}, adjustBegin, adjustEnd, stockNamesMap)
+            #        foundAnyFile = True
+            #        dao.upsertRows(etfCode, targetDate, rows)
+            #        continue
 
-                deadlineDateStr = deadline.strftime('%Y-%m-%d')
-                result = loadJsonForEtf(etfCode, folderName, deadlineDateStr, useTestJson)
-                if result is None:
-                    continue
-                _, newList, removedList, weightsMap = result
-                foundAnyFile = True
-                rows = buildJsonRows(etfCode, targetDate, newList, removedList, weightsMap,
-                                     adjustBegin, adjustEnd)
-                dao.upsertRows(etfCode, targetDate, rows)
-                continue
+            #    deadlineDateStr = deadline.strftime('%Y-%m-%d')
+            #    result = loadJsonForEtf(etfCode, folderName, deadlineDateStr, useTestJson)
+            #    if result is None:
+            #        continue
+            #    _, newList, removedList, weightsMap = result
+            #    foundAnyFile = True
+            #    rows = buildJsonRows(etfCode, targetDate, newList, removedList, weightsMap,
+            #                         adjustBegin, adjustEnd)
+            #    dao.upsertRows(etfCode, targetDate, rows)
+            #    continue
 
             # ── ELSE：正常期 ─────────────────────────────────────────────
             # 上傳窗口（effectiveDate ~ adjustEnd）之外才清理 stale CSV
