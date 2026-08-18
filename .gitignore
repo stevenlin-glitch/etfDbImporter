@@ -1,0 +1,5 @@
+conf/db_settings.yaml
+logs/
+dev/logs/
+__pycache__/
+*.pyc

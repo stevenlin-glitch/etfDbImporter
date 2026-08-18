@@ -1,0 +1,51 @@
+tradingDays: |
+  DECLARE @year INT = {0};
+  DECLARE @month INT = {1};
+  SELECT dd FROM (SELECT RANK() OVER(PARTITION BY YEAR(日期), MONTH(日期)
+  ORDER BY 日期 ASC) AS rn, 日期 AS dd FROM TEJ.dbo.台灣交易日
+  WHERE 休市 = 0) tmp
+  WHERE YEAR(dd) = @year
+  AND MONTH(dd) = @month
+  ORDER BY dd ASC
+
+tradingWeekday: |
+  DECLARE @year INT = {0};
+  DECLARE @month INT = {1};
+  DECLARE @weekday INT = {2} + 1;
+  SELECT 日期 AS dd
+  FROM TEJ.dbo.台灣交易日
+  WHERE 休市 = 0
+    AND YEAR(日期) = @year
+    AND MONTH(日期) = @month
+    AND DATEPART(WEEKDAY, 日期) = @weekday
+  ORDER BY 日期 ASC;
+
+queryDifShares: |
+  SELECT SYMBOL, DIFSHARES
+  FROM [TEJ].[dbo].[ETF成分每日增減明細]
+  WHERE DATADATE = ? AND FUNDID = ?
+
+queryTotalDifShares: |
+  SELECT SYMBOL, SUM(DIFSHARES) AS TOTAL_DIFSHARES
+  FROM [TEJ].[dbo].[ETF成分每日增減明細]
+  WHERE DATADATE >= ? AND DATADATE <= ? AND FUNDID = ?
+  GROUP BY SYMBOL
+
+fetchEtfHistory: |
+  SELECT stock_code, stock_name, action, estimated_shares
+  FROM [dbo].[etf_additions_history_dev]
+  WHERE etf_code = ? AND report_date = ?
+
+deleteEtfHistory: |
+  DELETE FROM [dbo].[etf_additions_history_dev]
+  WHERE etf_code = ? AND report_date = ?
+
+insertEtfHistory: |
+  INSERT INTO [dbo].[etf_additions_history_dev]
+      (etf_code, report_date, stock_code, stock_name, action,
+       weight, dividend_rate, reason, estimated_amount, estimated_shares,
+       adjust_begin, adjust_end)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+queryStockNames: |
+  SELECT sid, nn FROM [TEJ].[dbo].[v新日股價] WHERE dd = ?
