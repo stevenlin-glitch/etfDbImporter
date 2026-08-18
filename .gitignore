@@ -1,4 +1,4 @@
-conf/db_settings.yaml
+*db_settings.yaml
 logs/
 dev/logs/
 __pycache__/
