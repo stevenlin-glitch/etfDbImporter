@@ -171,7 +171,8 @@ def ensureTrackerCsv(etfCode, targetDate):
 
     產生後仍不存在（非調整期 / 無 showdown CSV / 執行失敗）回傳 None。
     """
-    csvPath = os.path.join(TRACKER_OUTPUT_DIR, f'{etfCode}_{targetDate}.csv')
+    # tracker 輸出在 output_csv/{etfCode}/ 子資料夾（固定檔名版，時間戳檔為歷史備份）
+    csvPath = os.path.join(TRACKER_OUTPUT_DIR, etfCode, f'{etfCode}_{targetDate}.csv')
     if os.path.exists(csvPath):
         return csvPath
 
