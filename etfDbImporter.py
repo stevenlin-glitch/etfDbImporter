@@ -1,7 +1,7 @@
 """
 ETF 成分股變動資料匯入工具
 =====================================
-讀取 report_generator 輸出的 JSON（或交易員提供的 showdown CSV），
+讀取 report_generator 輸出的 JSON（或 sitcRebalanceTracker 產出的反單策略 CSV），
 將「新增/刪除成分股」資料寫入 SQL Server 的 etf_additions_history 資料表。
 
 【資料來源選擇邏輯】
@@ -9,21 +9,14 @@ ETF 成分股變動資料匯入工具
   │ targetDate 非交易日 → 直接略過                                         │
   ├──────────────────────────────────────────────────────────────────────┤
   │ CASE 1：調整期（adjustBegin <= targetDate <= adjustEnd）                │
-  │   → 先查 DB90 [ETF成分每日增減明細] 取得當日 DIFSHARES（table90）         │
-  │                                                                      │
-  │   Sub-case 1a：showdown_csv/{etfCode}.csv 存在                        │
-  │     → CSV estimated_shares - SUM(adjust_begin~targetDate DIFSHARES)  │
-  │     → 寫 DB → 刪 CSV                                                  │
-  │                                                                      │
-  │   Sub-case 1b：無 CSV，且本期（adjustBegin ~ adjustEnd）內曾上傳過       │
-  │     → 取前一交易日的 DB estimated_shares - 當日 DIFSHARES → 寫 DB      │
-  │     → 若前一交易日無 DB 資料 → log error，不寫 DB                       │
-  │                                                                      │
-  │   Sub-case 1c：其餘情況（無 CSV、無有效 upload 紀錄）                    │
-  │     → log error，不寫 DB                                              │
+  │   → 讀 sitcRebalanceTracker/output_csv/{etfCode}_{targetDate}.csv │
+  │     （estimated_shares 為剩餘待調整量，tracker 已扣完 DIFSHARES，       │
+  │       importer 不再自行查減；weight/divRate/reason/estAmount 存 NULL） │
+  │   → 檔案不存在 → 同步呼叫 tracker --etf --date 產生一次                 │
+  │   → 仍不存在（非調整期/無 showdown CSV/執行失敗）→ log error，不寫 DB   │
   ├──────────────────────────────────────────────────────────────────────┤
   │ CASE 2：暫停期（deadline < targetDate < adjustBegin）                   │
-  │   → 讀取 {etfCode}_{deadline}_prod.json                               │
+  │   → 讀取 {etfCode}_{deadline}_prod.json（整段暫停期沿用 deadline 結果） │
   │   → buildJsonRows(...)，report_date 填 targetDate，dao.upsertRows()    │
   ├──────────────────────────────────────────────────────────────────────┤
   │ ELSE：正常期（其餘情況）                                                │
@@ -32,9 +25,10 @@ ETF 成分股變動資料匯入工具
   └──────────────────────────────────────────────────────────────────────┘
 
   特殊規則：
-  - 成分股在 CSV/前日 DB 有紀錄、但 table90 無此股票 → DIFSHARES 視為 0
-  - table90 出現 CSV/前日 DB 完全沒有的新股票 → 不填（DB 存 NULL）
+  - tracker CSV 的 estimated_shares 空值或非數字 → DB 存 NULL
   - JSON 來源不扣 DIFSHARES（保留 JSON 本身的估算欄位）
+  - importer 只負責填 report_date / adjust_begin / adjust_end，
+    調整期的數值計算一律以 tracker 產出為準
 """
 import os
 import re
@@ -43,10 +37,12 @@ import csv
 import sys
 import argparse
 import logging
+import subprocess
 from datetime import datetime, timedelta, date
 
 # DAO 模組放在非標準路徑，手動加入 sys.path 才能 import
-DAO_SRC_DIR = '/home/webuser/etf/etf_calculator/etfDbImporter/src'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DAO_SRC_DIR = os.path.join(BASE_DIR, 'src')
 if DAO_SRC_DIR not in sys.path:
     sys.path.insert(0, DAO_SRC_DIR)
 import DAO as DAO
@@ -58,11 +54,13 @@ import DAO as DAO
 # report_generator 的輸出目錄，內含 tmp_<etfCode>/ 子資料夾
 reportDir = '/home/webuser/etf/etf_calculator/report_generator'
 
-# 本腳本自身的根目錄，用來放 log 檔
-baseDir = '/home/webuser/etf/etf_calculator/etfDbImporter'
-
 # 交易員手動上傳的 showdown CSV 所在目錄，檔名格式：<etfCode>.csv
 showdownCsvDir = '/home/webuser/etf/showdown_csv'
+
+# sitcRebalanceTracker 產出的反單策略 CSV（調整期的資料來源）
+TRACKER_OUTPUT_DIR = '/home/webuser/etf/etf_calculator/sitcRebalanceTracker/output_csv'
+TRACKER_PY         = '/home/webuser/etf/etf_calculator/sitcRebalanceTracker/tracker.py'
+ETF_VENV_PY        = '/home/webuser/etf/venv/bin/python'
 
 # CSV 上傳時間紀錄檔（由前端寫入），用來判斷本調整期是否曾上傳過 CSV
 UPLOAD_TIMES_PATH = '/var/www/html/web/etf/home/upload_times.json'
@@ -74,6 +72,13 @@ ETF_DATES_PATH = '/home/webuser/etf/etf_calculator/report_generator/dateData/etf
 targetEtfList = ['0050', '0051', '0056', '00713', '00878', '00900', '00918', '00919_May', '00919_Dec', '00929']
 #targetEtfList = ['00929']
 
+# tracker CSV 額外欄位 → DB 欄位對照（順序 = insertEtfHistory 後段 15 欄的順序）
+TRACKER_EXTRA_COLS = [
+    '總調整量', '累計調整張', '累計調整進度(%)', '調整利差(%)',
+    '換手量', '調整倍數',
+    '外資當日買賣超', '外資當日買賣超占比(%)', '外資累計買賣超', '外資累計買賣超占比(%)',
+    '當日借券餘額', '當日借賣餘額', '當日借券賣出', '當日借賣可用額度', '借賣日內占比(%)',
+]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -82,7 +87,7 @@ targetEtfList = ['0050', '0051', '0056', '00713', '00878', '00900', '00918', '00
 
 def setupLogging(targetDate):
     """初始化 logging：同時輸出到檔案（logs/import_<date>.log）和 stdout。"""
-    logDir = os.path.join(baseDir, 'logs')
+    logDir = os.path.join(BASE_DIR, 'logs')
     if not os.path.exists(logDir):
         os.makedirs(logDir)
     logFile = os.path.join(logDir, f'import_{targetDate}.log')
@@ -161,6 +166,82 @@ def parseCsvFile(filePath):
     return newList, removedList, weightList
 
 
+def ensureTrackerCsv(etfCode, targetDate):
+    """回傳 tracker output CSV 路徑；不存在時同步呼叫 tracker 產生一次。
+
+    產生後仍不存在（非調整期 / 無 showdown CSV / 執行失敗）回傳 None。
+    """
+    # tracker 輸出在 output_csv/{etfCode}/ 子資料夾（固定檔名版，時間戳檔為歷史備份）
+    csvPath = os.path.join(TRACKER_OUTPUT_DIR, etfCode, f'{etfCode}_{targetDate}.csv')
+    if os.path.exists(csvPath):
+        return csvPath
+
+    logging.info(f'{etfCode} {targetDate} 無 tracker CSV, 呼叫 tracker 產生')
+    try:
+        result = subprocess.run(
+            [ETF_VENV_PY, TRACKER_PY, '--etf', etfCode, '--date', targetDate],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            logging.error(f'{etfCode} {targetDate} tracker 執行失敗: {(result.stderr or "")[-500:]}')
+    except subprocess.TimeoutExpired:
+        logging.error(f'{etfCode} {targetDate} tracker 執行超時 (>300s)')
+        return None
+    except Exception as e:
+        logging.exception(f'{etfCode} {targetDate} tracker 呼叫失敗: {e}')
+        return None
+
+    return csvPath if os.path.exists(csvPath) else None
+
+
+def _toFloat(raw):
+    """字串轉 float；空值或非數字回傳 None（DB 存 NULL）。"""
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parseTrackerCsv(filePath):
+    """讀 tracker output CSV -> [(stock_code, stock_name, action, estimated_shares, extras), ...]。
+
+    estimated_shares 為剩餘待調整量, tracker 已扣完 DIFSHARES, 這裡直接沿用;
+    extras 為 TRACKER_EXTRA_COLS 順序的 15 個 float(缺值 None)。
+    """
+    rows = []
+    with open(filePath, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = (row.get('estimated_shares') or '').strip()
+            try:
+                estShares = int(float(raw)) if raw else None
+            except ValueError:
+                estShares = None
+            extras = tuple(_toFloat(row.get(col)) for col in TRACKER_EXTRA_COLS)
+            rows.append((
+                (row.get('stock_code') or '').strip(),
+                (row.get('stock_name') or '').strip(),
+                (row.get('action') or '').strip(),
+                estShares,
+                extras,
+            ))
+    return rows
+
+
+def buildTrackerRows(etfCode, targetDate, trackerRows, adjustBegin, adjustEnd):
+    """把 tracker CSV 列轉成 INSERT tuple（12 舊欄 + 15 個 tracker 分析欄）。
+    weight / divRate / reason / estAmount 一律 NULL。"""
+    return [
+        (etfCode, targetDate, stockCode, stockName, action,
+         None, None, None, None, estShares,
+         adjustBegin, adjustEnd) + extras
+        for stockCode, stockName, action, estShares, extras in trackerRows
+    ]
+
+
 # ══════════════════════════════════════════════════════════════════
 # 交易日計算
 # ══════════════════════════════════════════════════════════════════
@@ -172,59 +253,13 @@ def isTradingDay(targetDateObj):
         tradingDays, _ = DAO.loadDataFromDB(year, month, DAO.KEY_FRIDAY)
         return targetDateObj in {td[DAO.KEY_DAY] for td in tradingDays}
     except Exception as e:
-        logging.error(f"isTradingDay check failed for {targetDateObj}: {e}")
+        logging.exception(f"isTradingDay check failed for {targetDateObj}: {e}")
         return False
-
-
-def getPreviousTradingDay(targetDateObj):
-    """
-    回傳 targetDateObj 前一個交易日，找不到則回傳 None。
-    先查當月，若 targetDateObj 為當月首個交易日則往前一個月繼續查。
-    """
-    year, month = targetDateObj.year, targetDateObj.month
-    for _ in range(2):  # 最多往前查兩個月
-        try:
-            tradingDays, _ = DAO.loadDataFromDB(year, month, DAO.KEY_FRIDAY)
-            # 取所有嚴格早於 targetDateObj 的交易日，取最新的一天
-            candidates = sorted(
-                [td[DAO.KEY_DAY] for td in tradingDays if td[DAO.KEY_DAY] < targetDateObj],
-                reverse=True
-            )
-            if candidates:
-                return candidates[0]
-        except Exception as e:
-            logging.error(f"getPreviousTradingDay failed for {year}-{month}: {e}")
-            return None
-        # 當月無結果，往前一個月
-        if month == 1:
-            year, month = year - 1, 12
-        else:
-            month -= 1
-    return None
 
 
 # ══════════════════════════════════════════════════════════════════
 # upload_times.json 讀取
 # ══════════════════════════════════════════════════════════════════
-
-def getUploadDateForEtf(etfCode):
-    """
-    從 UPLOAD_TIMES_PATH 讀取 etfCode 的最後 CSV 上傳時間，以 date 物件回傳。
-    檔案不存在或無對應 key 時回傳 None。
-
-    JSON 格式範例：
-      { "today": "2026-06-12", "0056": "2026-06-10 16:48:01", ... }
-    """
-    try:
-        with open(UPLOAD_TIMES_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        timeStr = data.get(etfCode)
-        if timeStr:
-            return datetime.strptime(timeStr, '%Y-%m-%d %H:%M:%S').date()
-    except Exception as e:
-        logging.warning(f"Failed to read upload_times.json: {e}")
-    return None
-
 
 def getTodayFromUploadTimes():
     """
@@ -243,7 +278,7 @@ def getTodayFromUploadTimes():
             except ValueError:
                 continue
     except Exception as e:
-        print(f"Failed to read today from upload_times.json: {e}")
+        logging.warning(f"Failed to read today from upload_times.json: {e}")
     return None
 
 
@@ -296,35 +331,6 @@ def buildAdjustRows(etfCode, targetDate, newList, removedList, weightList, difSh
     return rows
 
 
-def buildAdjustRowsFromPrevDb(etfCode, targetDate, prevRecords, difShares, adjustBegin, adjustEnd, stockNamesMap=None):
-    """
-    Case 2b（前一交易日 DB 來源）用。
-    對前日每筆記錄計算 estimated_shares - DIFSHARES，
-    回傳 INSERT 用的 tuple 清單。
-    若前日 stock_name 為空，以 stockNamesMap（v新日股價）補上。
-    weight / divRate / reason / estAmount 一律存 NULL。
-    """
-    rows = []
-    for record in prevRecords:
-        stockCode  = record['stock_code']
-        stockName  = record['stock_name']
-        if not stockName and stockNamesMap:
-            stockName = stockNamesMap.get(stockCode, '')
-        action     = record['action']
-        estShares  = record['estimated_shares']
-
-        # 扣減當日實際成交量；若 difShares 無此股則 DIFSHARES 視為 0
-        if estShares is not None:
-            estShares = int(estShares - difShares.get(stockCode, 0))
-
-        rows.append((
-            etfCode, targetDate, stockCode, stockName, action,
-            None, None, None, None, estShares,
-            adjustBegin, adjustEnd
-        ))
-    return rows
-
-
 # ══════════════════════════════════════════════════════════════════
 # JSON 資料列建構
 # ══════════════════════════════════════════════════════════════════
@@ -355,7 +361,7 @@ def buildJsonRows(etfCode, reportDate, newList, removedList, weightsMap, adjustB
                 etfCode, reportDate, stockCode, stockName, action,
                 weight, divRate, reason, estAmount, estShares,
                 adjustBegin, adjustEnd
-            ))
+            ) + (None,) * len(TRACKER_EXTRA_COLS))
     return rows
 
 
@@ -378,7 +384,7 @@ def loadJsonForEtf(etfCode, folderName, targetDate, useTestJson=False):
     try:
         return parseJsonFile(filePath)
     except Exception as e:
-        logging.error(f"Error reading JSON for {etfCode}: {e}")
+        logging.exception(f"Error reading JSON for {etfCode}: {e}")
         return None
 
 
@@ -438,7 +444,7 @@ def importDataForDate(targetDate, useTestJson=False):
     try:
         dao.connect()
     except Exception as e:
-        logging.error(f"Failed to connect to DB: {e}")
+        logging.exception(f"Failed to connect to DB: {e}")
         return
 
     try:
@@ -449,7 +455,7 @@ def importDataForDate(targetDate, useTestJson=False):
             with open(ETF_DATES_PATH, 'r', encoding='utf-8') as f:
                 etfDates = json.load(f)
         except Exception as e:
-            logging.error(f"Failed to read etf_dates.json: {e}")
+            logging.exception(f"Failed to read etf_dates.json: {e}")
             return
 
         for etfCode in targetEtfList:
@@ -516,97 +522,48 @@ def importDataForDate(targetDate, useTestJson=False):
             inAdjust      = info['inAdjust']
             csvPath       = os.path.join(showdownCsvDir, f"{etfCode}.csv")
 
-            # ── CASE 1：調整期 ───────────────────────────────────────────
+            # ── CASE 1：調整期 → 以 sitcRebalanceTracker 的 output CSV 為準 ──
             if inAdjust:
-                fundId = etfCode.split('_')[0]  # '00919_May' → '00919'
+                trackerCsv = ensureTrackerCsv(etfCode, targetDate)
+                if trackerCsv is None:
+                    logging.error(f'[AdjPeriod] {etfCode} {targetDate} 無 tracker CSV, 跳過寫入 DB')
+                    continue
 
-                if os.path.exists(csvPath):
-                    # ── Sub-case 1a：有 CSV → estimated - 累加 DIFSHARES（adjust_begin ~ target_date）──
-                    difShares = dao.queryTotalDifShares(
-                        adjustBegin.strftime('%Y-%m-%d'), targetDate, fundId
-                    )
-                    logging.info(
-                        f"{etfCode}: total difShares ({adjustBegin}~{targetDate}) has {len(difShares)} entries"
-                    )
-                    logging.info(f"[AdjPeriod] Case1a - Using CSV for {etfCode}")
-                    try:
-                        newList, removedList, weightList = parseCsvFile(csvPath)
-                    except Exception as e:
-                        logging.error(f"Error reading CSV for {etfCode}: {e}")
-                        try:
-                            os.remove(csvPath)
-                        except Exception:
-                            pass
-                        continue
+                logging.info(f'[AdjPeriod] Using tracker CSV for {etfCode}: {trackerCsv}')
+                try:
+                    trackerRows = parseTrackerCsv(trackerCsv)
+                except Exception as e:
+                    logging.exception(f'{etfCode} 讀 tracker CSV 失敗: {e}')
+                    continue
+                if not trackerRows:
+                    logging.error(f'[AdjPeriod] {etfCode} tracker CSV 無資料列, 跳過')
+                    continue
 
-                    stockNamesMap = dao.queryStockNames(targetDate)
-                    logging.info(f"{etfCode}: fetched {len(stockNamesMap)} stock names from v新日股價 ({targetDate})")
-                    rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
-                                           difShares, adjustBegin, adjustEnd, stockNamesMap)
-                    foundAnyFile = True
-                    dao.upsertRows(etfCode, targetDate, rows)
-
-                    # CSV 用完即刪，下一個交易日自動進 Sub-case 1b 流程
-                    try:
-                        os.remove(csvPath)
-                        logging.info(f"Deleted used CSV for {etfCode}")
-                    except Exception as e:
-                        logging.warning(f"Failed to delete CSV for {etfCode}: {e}")
-
-                else:
-                    # 確認 upload_times.json 是否在本期（adjustBegin ~ adjustEnd）內曾上傳過 CSV
-                    uploadDate     = getUploadDateForEtf(etfCode)
-                    hasValidUpload = (uploadDate is not None and
-                                      adjustBegin is not None and
-                                      adjustBegin <= uploadDate <= adjustEnd)
-
-                    if hasValidUpload:
-                        # ── Sub-case 1b：前一交易日 DB estimated - 當日 DIFSHARES ──
-                        difShares     = dao.queryDifShares(targetDate, fundId)
-                        logging.info(f"{etfCode}: difShares has {len(difShares)} entries for {targetDate}")
-                        stockNamesMap = dao.queryStockNames(targetDate)
-                        logging.info(f"{etfCode}: fetched {len(stockNamesMap)} stock names from v新日股價 ({targetDate})")
-                        prevDay     = getPreviousTradingDay(targetDateObj)
-                        prevRecords = dao.fetchPrevDayRecords(etfCode, prevDay) if prevDay else []
-
-                        if prevRecords:
-                            logging.info(f"[AdjPeriod] Case1b - prev DB ({prevDay}) for {etfCode}")
-                            rows = buildAdjustRowsFromPrevDb(
-                                etfCode, targetDate, prevRecords, difShares, adjustBegin, adjustEnd, stockNamesMap
-                            )
-                            foundAnyFile = True
-                            dao.upsertRows(etfCode, targetDate, rows)
-                        else:
-                            # 前日 DB 無資料，不寫 DB
-                            logging.error(
-                                f"[AdjPeriod] Case1b - no prev DB records for {etfCode} ({prevDay}), skipping"
-                            )
-                    else:
-                        # ── Sub-case 1c：無有效 upload 紀錄，不寫 DB，通知工程師 ──
-                        logging.error(f"[AdjPeriod] Case1c - no valid upload record for {etfCode}, skipping")
-
+                rows = buildTrackerRows(etfCode, targetDate, trackerRows, adjustBegin, adjustEnd)
+                foundAnyFile = True
+                dao.upsertRows(etfCode, targetDate, rows)
                 continue
-
+            
             # ── CASE 2：暫停期 ───────────────────────────────────────────
             if deadline is not None and adjustBegin is not None and deadline < targetDateObj < adjustBegin:
                 # Hard-coded: 00929 / 00918 讀 _tmp.csv，不讀截止日 JSON，不扣 DIFSHARES，不刪 CSV
-                if etfCode in ('00929', '00918'):
-                    tmpCsvPath = os.path.join(showdownCsvDir, f"{etfCode}_tmp.csv")
-                    if not os.path.exists(tmpCsvPath):
-                        logging.error(f"[SuspendPeriod][{etfCode}] _tmp.csv not found: {tmpCsvPath}, skipping")
-                        continue
-                    logging.info(f"[SuspendPeriod][{etfCode}] Using _tmp.csv: {tmpCsvPath}")
-                    try:
-                        newList, removedList, weightList = parseCsvFile(tmpCsvPath)
-                    except Exception as e:
-                        logging.error(f"[SuspendPeriod][{etfCode}] Error reading _tmp.csv: {e}")
-                        continue
-                    stockNamesMap = dao.queryStockNames(targetDate)
-                    rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
-                                           {}, adjustBegin, adjustEnd, stockNamesMap)
-                    foundAnyFile = True
-                    dao.upsertRows(etfCode, targetDate, rows)
-                    continue
+                #if etfCode in ('00929', '00918'):
+                #    tmpCsvPath = os.path.join(showdownCsvDir, f"{etfCode}_tmp.csv")
+                #    if not os.path.exists(tmpCsvPath):
+                #        logging.error(f"[SuspendPeriod][{etfCode}] _tmp.csv not found: {tmpCsvPath}, skipping")
+                #        continue
+                #    logging.info(f"[SuspendPeriod][{etfCode}] Using _tmp.csv: {tmpCsvPath}")
+                #    try:
+                #        newList, removedList, weightList = parseCsvFile(tmpCsvPath)
+                #    except Exception as e:
+                #        logging.exception(f"[SuspendPeriod][{etfCode}] Error reading _tmp.csv: {e}")
+                #        continue
+                #    stockNamesMap = dao.queryStockNames(targetDate)
+                #    rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
+                #                           {}, adjustBegin, adjustEnd, stockNamesMap)
+                #    foundAnyFile = True
+                #    dao.upsertRows(etfCode, targetDate, rows)
+                #    continue
 
                 deadlineDateStr = deadline.strftime('%Y-%m-%d')
                 result = loadJsonForEtf(etfCode, folderName, deadlineDateStr, useTestJson)
@@ -646,6 +603,9 @@ def importDataForDate(targetDate, useTestJson=False):
         if not foundAnyFile:
             logging.warning(f"No files found for target date: {targetDate}")
 
+    except Exception as e:
+        logging.exception(f"Unhandled error during import for {targetDate}: {e}")
+        raise
     finally:
         dao.close()
 
@@ -678,9 +638,13 @@ if __name__ == "__main__":
         targetDate = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     print(targetDate)
 
-    #targetDate = '2026-07-03'
+    #targetDate = '2026-06-26'
     setupLogging(targetDate)
-    importDataForDate(targetDate, useTestJson=args.test)
+    try:
+        importDataForDate(targetDate, useTestJson=args.test)
+    except Exception as e:
+        logging.exception(f"Fatal error: {e}")
+        sys.exit(1)
 
 # # 切換至虛擬環境
 # source ~/etf/venv/bin/activate

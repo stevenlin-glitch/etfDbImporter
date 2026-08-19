@@ -44,8 +44,12 @@ insertEtfHistory: |
   INSERT INTO [dbo].[etf_additions_history]
       (etf_code, report_date, stock_code, stock_name, action,
        weight, dividend_rate, reason, estimated_amount, estimated_shares,
-       adjust_begin, adjust_end)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       adjust_begin, adjust_end,
+       [總調整量], [累計調整張], [累計調整進度(%)], [調整利差(%)],
+       [換手量], [調整倍數],
+       [外資當日買賣超], [外資當日買賣超占比(%)], [外資累計買賣超], [外資累計買賣超占比(%)],
+       [當日借券餘額], [當日借賣餘額], [當日借券賣出], [當日借賣可用額度], [借賣日內占比(%)])
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 queryStockNames: |
   SELECT sid, nn FROM [TEJ].[dbo].[v新日股價] WHERE dd = ?
