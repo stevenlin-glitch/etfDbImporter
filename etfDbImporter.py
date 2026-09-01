@@ -5,24 +5,28 @@ ETF 成分股變動資料匯入工具
 將「新增/刪除成分股」資料寫入 SQL Server 的 etf_additions_history 資料表。
 
 【資料來源選擇邏輯】
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │ targetDate 非交易日 → 直接略過                                         │
-  ├──────────────────────────────────────────────────────────────────────┤
-  │ CASE 1：調整期（adjustBegin <= targetDate <= adjustEnd）                │
-  │   → 讀 sitcRebalanceTracker/output_csv/{etfCode}_{targetDate}.csv │
-  │     （estimated_shares 為剩餘待調整量，tracker 已扣完 DIFSHARES，       │
-  │       importer 不再自行查減；weight/divRate/reason/estAmount 存 NULL） │
-  │   → 檔案不存在 → 同步呼叫 tracker --etf --date 產生一次                 │
-  │   → 仍不存在（非調整期/無 showdown CSV/執行失敗）→ log error，不寫 DB   │
-  ├──────────────────────────────────────────────────────────────────────┤
-  │ CASE 2：暫停期（deadline < targetDate < adjustBegin）                   │
-  │   → 讀取 {etfCode}_{deadline}_prod.json（整段暫停期沿用 deadline 結果） │
-  │   → buildJsonRows(...)，report_date 填 targetDate，dao.upsertRows()    │
-  ├──────────────────────────────────────────────────────────────────────┤
-  │ ELSE：正常期（其餘情況）                                                │
-  │   → Stale CSV 清理（upload window adjust_effective ~ adjustEnd 外才刪） │
-  │   → 讀取 {etfCode}_{targetDate}_prod.json，不扣 DIFSHARES              │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────────────────────────┐
+  │ targetDate 非交易日 → 直接略過
+  ├────────────────────────────────────────────────────────────────────────────────────┤
+  │ CASE 1：調整期（adjustBegin <= targetDate <= adjustEnd）
+  │   → 讀 sitcRebalanceTracker/output_csv/{etfCode}_{targetDate}.csv
+  │     （estimated_shares 為剩餘待調整量，tracker 已扣完 DIFSHARES，
+  │       importer 不再自行查減；weight/divRate/reason/estAmount 存 NULL）
+  │   → 檔案不存在 → 同步呼叫 tracker --etf --date 產生一次
+  │   → 仍不存在（非調整期/無 showdown CSV/執行失敗）→ log error，不寫 DB
+  ├────────────────────────────────────────────────────────────────────────────────────┤
+  │ CASE 2：暫停期（deadline < targetDate < adjustBegin）
+  │   2a 公告後（uploadBegin <= targetDate）且 showdown_csv/ 有檔名日期落在
+  │      [uploadBegin, targetDate] 的上傳 CSV → 以 mtime 最新那份寫 DB：
+  │      estimated_shares 用 CSV 原值不扣 DIFSHARES，tracker 15 欄與
+  │      weight/divRate/reason/estAmount 存 NULL，stock_name 優先查 DB。不呼叫 tracker。
+  │   2b 其餘 → 讀取 {etfCode}_{deadline}_prod.json（整段暫停期沿用 deadline 結果
+  │   → buildJsonRows(...)，report_date 填 targetDate，dao.upsertRows()
+  ├────────────────────────────────────────────────────────────────────────────────────┤
+  │ ELSE：正常期（其餘情況）
+  │   → Stale CSV 清理（upload window adjust_effective ~ adjustEnd 外才刪）
+  │   → 讀取 {etfCode}_{targetDate}_prod.json，不扣 DIFSHARES
+  └────────────────────────────────────────────────────────────────────────────────────┘
 
   特殊規則：
   - tracker CSV 的 estimated_shares 空值或非數字 → DB 存 NULL
@@ -79,6 +83,10 @@ TRACKER_EXTRA_COLS = [
     '外資當日買賣超', '外資當日買賣超占比(%)', '外資累計買賣超', '外資累計買賣超占比(%)',
     '當日借券餘額', '當日借賣餘額', '當日借券賣出', '當日借賣可用額度', '借賣日內占比(%)',
 ]
+
+# 上傳檔檔名規則。必須與 tracker.py findLatestShowdownCsv、app.py _has_showdown_csv、
+# etfPipeline/adjust_handler.py find_latest_upload_csv 完全一致（四處耦合），改一處要同步。
+UPLOAD_CSV_PATTERN = r'^{etf}_(\d{{8}})(_\d{{6}})?\.csv$'
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -140,6 +148,7 @@ def parseCsvFile(filePath):
     CSV 欄位格式：
       etf_code, stock_code, stock_name, action, estimated_shares
       （action 值為 'addition' 或 'deletion'）
+      （stock_name 選填）
 
     回傳：(newList, removedList, {})
     """
@@ -164,6 +173,27 @@ def parseCsvFile(filePath):
                 weightList.append(item)
 
     return newList, removedList, weightList
+
+
+def findLatestUploadCsv(etfCode, uploadBegin, targetDateObj):
+    """回傳 showdownCsvDir 中「檔名日期落在 [uploadBegin, targetDate]」的上傳 CSV 裡 mtime 最新的路徑；沒有回 None。
+
+    上限用 targetDate 而不是 adjust_end：不溯及既往——補跑舊日期時不能拿到「之後才上傳」的檔。
+    過濾用檔名日期不用 mtime：dev mock date 下檔名是模擬時間、mtime 是真實時間（同 tracker）。
+    取最新用 mtime：mock date 倒退時新檔的檔名時間戳會比舊檔小（同 tracker）。
+    """
+    begin8 = uploadBegin.strftime('%Y%m%d')
+    end8   = targetDateObj.strftime('%Y%m%d')
+    pattern = re.compile(UPLOAD_CSV_PATTERN.format(etf=re.escape(etfCode)))
+    candidates = []
+    try:
+        for name in os.listdir(showdownCsvDir):
+            m = pattern.match(name)
+            if m and begin8 <= m.group(1) <= end8:
+                candidates.append(os.path.join(showdownCsvDir, name))
+    except OSError:
+        return None
+    return max(candidates, key=os.path.getmtime) if candidates else None
 
 
 def ensureTrackerCsv(etfCode, targetDate):
@@ -299,35 +329,26 @@ def _parseStockNameParts(rawName):
     return stockCode, stockName
 
 
-def buildAdjustRows(etfCode, targetDate, newList, removedList, weightList, difShares, adjustBegin, adjustEnd, stockNamesMap):
-    """
-    Case 1（CSV 來源）用。
-    對 CSV 中每檔成分股計算 estimated_shares - DIFSHARES，
-    回傳 INSERT 用的 tuple 清單。
-    stock_name 優先從 stockNamesMap（v新日股價）查找，查無則以 CSV 欄位值為備用。
-    weight / divRate / reason / estAmount 一律存 NULL（CSV 無此欄位）。
-    """
+def buildUploadRows(etfCode, targetDate, newList, removedList, weightList, adjustBegin, adjustEnd, stockNamesMap):
+    """CASE 2a（公告後、交易員上傳 CSV 來源）用。
+    estimated_shares 用 CSV 原值（不扣 DIFSHARES：公告後尚未開始調整，沒有增減明細可扣）；
+    weight / divRate / reason / estAmount 與 tracker 15 個分析欄一律 NULL；
+    stock_name 優先從 stockNamesMap（v新日股價）查，查無才用 CSV 欄位（上傳檔通常沒有這欄）。"""
     rows = []
     for action, itemList in [('addition', newList), ('deletion', removedList), ('weight', weightList)]:
         for item in itemList:
             stockCode = item['stock_code']
             stockName = stockNamesMap.get(stockCode) or item.get('stock_name', '')
-
-            rawEstShares = item.get('estimated_shares', '')
+            raw = (item.get('estimated_shares') or '').strip()
             try:
-                estShares = float(rawEstShares) if rawEstShares else None
+                estShares = int(float(raw)) if raw else None
             except (ValueError, TypeError):
                 estShares = None
-
-            # 扣減當日實際成交量；若 difShares 無此股則 DIFSHARES 視為 0
-            if estShares is not None:
-                estShares = int(estShares - difShares.get(stockCode, 0))
-
             rows.append((
                 etfCode, targetDate, stockCode, stockName, action,
                 None, None, None, None, estShares,
                 adjustBegin, adjustEnd
-            ))
+            ) + (None,) * len(TRACKER_EXTRA_COLS))
     return rows
 
 
@@ -447,6 +468,10 @@ def importDataForDate(targetDate, useTestJson=False):
         logging.exception(f"Failed to connect to DB: {e}")
         return
 
+    def _emptyAdjustInfo():
+        return {'effectiveDate': None, 'deadline': None, 'begin': None, 'end': None,
+                'uploadBegin': None, 'inAdjust': False}
+
     try:
         # ── Step 3：從 etf_dates.json 讀取調整期資料 ────────────────────
         adjustInfo = {}
@@ -461,25 +486,27 @@ def importDataForDate(targetDate, useTestJson=False):
         for etfCode in targetEtfList:
             entry = etfDates.get(etfCode)
             if not entry:
-                adjustInfo[etfCode] = {'effectiveDate': None, 'deadline': None, 'begin': None, 'end': None, 'inAdjust': False}
+                adjustInfo[etfCode] = _emptyAdjustInfo()
                 logging.warning(f"No entry in etf_dates.json for {etfCode}")
                 continue
 
             adjEffectiveStr = entry.get('adjust_effective')
             adjustBeginStr  = entry.get('adjust_begin')
             adjustEndStr    = entry.get('adjust_end')
+            uploadBeginStr  = entry.get('upload_begin') or adjustBeginStr
             deadlineStr     = entry.get('adjust_deadline')
 
             if not adjEffectiveStr or not adjustBeginStr or not adjustEndStr:
-                adjustInfo[etfCode] = {'effectiveDate': None, 'deadline': None, 'begin': None, 'end': None, 'inAdjust': False}
+                adjustInfo[etfCode] = _emptyAdjustInfo()
                 continue
 
             try:
                 effectiveDate = datetime.strptime(adjEffectiveStr, '%Y-%m-%d').date()
                 adjustBegin   = datetime.strptime(adjustBeginStr,  '%Y-%m-%d').date()
                 adjustEnd     = datetime.strptime(adjustEndStr,    '%Y-%m-%d').date()
+                uploadBegin = datetime.strptime(uploadBeginStr, '%Y-%m-%d').date()
             except Exception as e:
-                adjustInfo[etfCode] = {'effectiveDate': None, 'deadline': None, 'begin': None, 'end': None, 'inAdjust': False}
+                adjustInfo[etfCode] = _emptyAdjustInfo()
                 logging.warning(f"Failed to parse dates for {etfCode} in etf_dates.json: {e}")
                 continue
 
@@ -491,11 +518,12 @@ def importDataForDate(targetDate, useTestJson=False):
                 'deadline':      deadline,
                 'begin':         adjustBegin,
                 'end':           adjustEnd,
+                'uploadBegin':   uploadBegin,
                 'inAdjust':      inAdjust,
             }
             logging.info(
                 f"{etfCode}: adjust_effective={effectiveDate}, deadline={deadline}, "
-                f"adjust_begin={adjustBegin}, adjust_end={adjustEnd}, inAdjust={inAdjust}"
+                f"adjust_begin={adjustBegin}, adjust_end={adjustEnd}, upload_begin={uploadBegin}, inAdjust={inAdjust}"
             )
 
         # ── Step 4：逐一處理各 ETF 資料夾 ───────────────────────────────
@@ -514,11 +542,12 @@ def importDataForDate(targetDate, useTestJson=False):
             if etfCode not in targetEtfList:
                 continue
 
-            info          = adjustInfo.get(etfCode, {'effectiveDate': None, 'deadline': None, 'begin': None, 'end': None, 'inAdjust': False})
+            info          = adjustInfo.get(etfCode, _emptyAdjustInfo())
             etfEffDate    = info['effectiveDate']
             deadline      = info['deadline']
             adjustBegin   = info['begin']
             adjustEnd     = info['end']
+            uploadBegin   = info['uploadBegin']
             inAdjust      = info['inAdjust']
             csvPath       = os.path.join(showdownCsvDir, f"{etfCode}.csv")
 
@@ -546,25 +575,28 @@ def importDataForDate(targetDate, useTestJson=False):
             
             # ── CASE 2：暫停期 ───────────────────────────────────────────
             if deadline is not None and adjustBegin is not None and deadline < targetDateObj < adjustBegin:
-                # Hard-coded: 00929 / 00918 讀 _tmp.csv，不讀截止日 JSON，不扣 DIFSHARES，不刪 CSV
-                #if etfCode in ('00929', '00918'):
-                #    tmpCsvPath = os.path.join(showdownCsvDir, f"{etfCode}_tmp.csv")
-                #    if not os.path.exists(tmpCsvPath):
-                #        logging.error(f"[SuspendPeriod][{etfCode}] _tmp.csv not found: {tmpCsvPath}, skipping")
-                #        continue
-                #    logging.info(f"[SuspendPeriod][{etfCode}] Using _tmp.csv: {tmpCsvPath}")
-                #    try:
-                #        newList, removedList, weightList = parseCsvFile(tmpCsvPath)
-                #    except Exception as e:
-                #        logging.exception(f"[SuspendPeriod][{etfCode}] Error reading _tmp.csv: {e}")
-                #        continue
-                #    stockNamesMap = dao.queryStockNames(targetDate)
-                #    rows = buildAdjustRows(etfCode, targetDate, newList, removedList, weightList,
-                #                           {}, adjustBegin, adjustEnd, stockNamesMap)
-                #    foundAnyFile = True
-                #    dao.upsertRows(etfCode, targetDate, rows)
-                #    continue
+                # 2a：公告後且交易員已上傳 → 以上傳 CSV 為準，不呼叫 tracker
+                if uploadBegin is not None and uploadBegin <= targetDateObj:
+                    uploadCsv = findLatestUploadCsv(etfCode, uploadBegin, targetDateObj)
+                    if uploadCsv is not None:
+                        logging.info(f'[PreAdjust] {etfCode} {targetDate} 使用上傳 CSV: {uploadCsv}')
+                        try:
+                            newList, removedList, weightList = parseCsvFile(uploadCsv)
+                        except Exception as e:
+                            logging.exception(f'[PreAdjust] {etfCode} 讀上傳 CSV 失敗: {e}')
+                            continue
+                        stockNamesMap = dao.queryStockNames(targetDate)
+                        rows = buildUploadRows(etfCode, targetDate, newList, removedList, weightList,
+                                               adjustBegin, adjustEnd, stockNamesMap)
+                        if not rows:
+                            logging.error(f'[PreAdjust] {etfCode} 上傳 CSV 無資料列, 跳過')
+                            continue
+                        foundAnyFile = True
+                        dao.upsertRows(etfCode, targetDate, rows)
+                        continue
+                    logging.info(f'[PreAdjust] {etfCode} {targetDate} 公告後尚未上傳 CSV, 退回 deadline JSON')
 
+                # 2b：原本的暫停期邏輯，不動
                 deadlineDateStr = deadline.strftime('%Y-%m-%d')
                 result = loadJsonForEtf(etfCode, folderName, deadlineDateStr, useTestJson)
                 if result is None:
